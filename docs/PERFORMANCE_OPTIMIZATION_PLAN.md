@@ -669,3 +669,260 @@ Then work through the hypothesis table above. In particular:
 - Compare `Udp: RcvbufErrors` (via `vpn doctor --performance`) before and
   after this pass, under real load, for the closest thing this project
   has to direct evidence on H6/G1.
+
+---
+
+## 2026-08-12 addendum: root-cause audit against PR #16, and what changed
+
+This session's task was to find the *actual* bottleneck rather than add
+more tuning, starting from the assumption that PR #16 (the pass
+documented above) might already be sufficient, insufficient, or partly
+unwired. **This session had no SSH access to any production VPS and no
+Russia-side vantage point** — confirmed at the start (no credentials, no
+inventory file, no VPN config present in this environment) — so
+everything below is either a code/upstream-documentation fact or an
+explicit "cannot be measured here."
+
+### Root-cause matrix
+
+**CONFIRMED FROM CODE** (re-verified against HEAD, not assumed from the
+PR #16 description):
+- `deploy/lib/perf-tuning.sh` sets exactly 4 sysctls (rmem/wmem 16MiB
+  ceilings, conditionally-gated BBR + fq/fq_codel), nothing else — no
+  generic tuning cruft. Idempotent, capability-gated (never forces BBR on
+  a kernel that doesn't support it), has a real rollback path, and is
+  wired into **both** `install.sh` and `update.sh` with no drift between
+  them.
+- `Nice=-5` on `sing-box.service` is real and is the only CPU-scheduling
+  directive present (no `CPUQuota`/`CPUWeight`).
+- Hysteria2 Brutal (`up_mbps`/`down_mbps`) is `Option<u32>`, defaults to
+  `None`, validated together-or-neither, and is never populated with a
+  guessed value anywhere in the renderer.
+- The default subscription profile is `Reliability` (VLESS+REALITY), and
+  the code says why in-line: "the only profile safe to run as a
+  fleet-wide default under active DPI" — a deliberate anti-censorship
+  tradeoff, not a throughput claim. This is unchanged and was judged
+  correct, not a bug.
+- The client subscription's routing is `route.final -> select` only —
+  no `route.rules`, no GeoIP/domestic-bypass logic anywhere in
+  `crates/compat-config` or `services/subscription`. Confirmed
+  full-tunnel by omission, not by an explicit documented design choice.
+- Server/outbound selection (`auto` / `urltest`) is a plain HTTPS
+  latency/success race — the code's own comments already say this is not
+  throughput- or loss-aware, and `crates/network-state`'s `Observation`
+  type has no latency/throughput field to build one from without new
+  instrumentation work.
+- The previously-reverted multi-node scaffolding (commits `50838b7` →
+  `9c674fd`) was reverted because it was **unwired dead code** (nothing
+  in `apps/admin` or `services/subscription` ever constructed a
+  `NodeSpec`) and because credential-bearing state was judged to need
+  its own dedicated security review — not because multi-node itself was
+  rejected as an idea. `docs/TELEGRAM_RESILIENCE_PLAN.md` §K already
+  contains a considered design (independent per-node deployments + a
+  thin merge layer, explicitly rejecting shared/replicated identity as
+  riskier) and a zero-code interim mitigation (two independent
+  deployments, two subscription URLs, manually switched). Its one real
+  gap — no rollback story — is fixed in this pass (see below).
+- `nf_conntrack_max`/`nf_conntrack_buckets` are untouched anywhere in the
+  repo (neither `perf-tuning.sh` nor the firewall scripts); this was
+  previously a deliberate, documented "no evidence" omission (see
+  "Future work not implemented this pass" above), which this session's
+  independent review agreed is architecturally plausible but still
+  unmeasured — see below for what was and wasn't done about it.
+
+**CONFIRMED FROM UPSTREAM DOCUMENTATION** (current sing-box/Hysteria2/
+Linux-networking primary sources, re-checked this session):
+- Hysteria2 runs on quic-go (userspace QUIC); Hysteria2's own
+  performance guide states a CPU-throttled/low-power VPS can become the
+  bottleneck. No authoritative source gives a concrete Mbps-per-core
+  number for this workload — the qualitative risk is confirmed, the
+  specific threshold is not.
+- Hysteria2's own docs explicitly warn against setting Brutal
+  `up_mbps`/`down_mbps` higher than real capacity — doing so causes
+  self-inflicted congestion/instability. This validates the existing
+  "opt-in only, never a guessed value" code as correct, not overcautious.
+- **Multiple major Russian ISPs (Yota, MTS, Megafon, Beeline) are
+  documented (net4people/bbs #108, tracked since 2022, corroborated by a
+  2026 FOCI paper) to block or silently drop QUIC Initial Packets on
+  UDP/443 to foreign destinations.** This is the single most consequential
+  new finding this session added: a Hysteria2 shortfall for Russian users
+  can be ISP-side censorship of the QUIC transport itself, independent of
+  — and potentially larger than — any server-side CPU question. This was
+  not previously documented in this repository.
+- Since June 2025, Russian ISPs have additionally throttled
+  Cloudflare-fronted traffic (TCP and QUIC) to roughly 16KB/s; this
+  repository's REALITY endpoints front through the VPS's own IP, not
+  Cloudflare, so it is not directly implicated, but is worth knowing if a
+  future change ever routes through Cloudflare IP space.
+- AmneziaWG has near-parity real-world throughput with vanilla
+  WireGuard, but **sing-box does not natively support it** (open feature
+  requests SagerNet/sing-box#2276, #4045, unofficial forks only) and
+  **Hiddify does not list it** among supported protocols. Adopting it
+  would require either the official Amnezia client or a sing-box fork,
+  breaking this project's stated Hiddify-compatibility goal without a
+  clear compensating win over the QUIC-blocking finding above, which
+  Hysteria2-over-TCP-disguised-REALITY already partially sidesteps by
+  existing as a fallback.
+
+**LIKELY BUT UNMEASURED:**
+- Whether 1 vCPU actually saturates at real production Hysteria2
+  throughput (qualitatively plausible per upstream docs; no number from
+  this deployment).
+- Whether VLESS+REALITY (TCP) suffers materially worse head-of-line
+  blocking than Hysteria2 (QUIC) on the real Russia→VPS path specifically
+  — this is a generic TCP-vs-QUIC property from general protocol
+  literature, not a REALITY- or Hysteria2-project-published benchmark.
+- Conntrack table exhaustion under real concurrent-client load (default
+  bucket sizing on a 2GB host is plausibly low enough to matter under
+  many-flow fan-out from browsing traffic; no load test exists to
+  confirm or refute this in this repository).
+- Whether `Nice=-5` produces any observable sshd/systemd latency under
+  real contention (the mechanism is sound — CFS proportional weighting,
+  not RT starvation — but this has not been load-tested).
+
+**CANNOT BE MEASURED FROM THIS ENVIRONMENT:**
+Everything requiring a live VPS or a Russia-side vantage point: actual
+CPU/steal during a real transfer, whether `perf-tuning.sh` has actually
+been *run* on the production host (repository state is not proof of
+runtime state — this remains genuinely unverified), actual RU→VPS loss/
+jitter/UDP treatment, ASN/peering quality, and real sustained bandwidth
+figures needed to safely configure Brutal. This session had no SSH
+access and no way to reach a Russian network vantage point; anyone with
+that access should run `vpn doctor --performance`, `vpn-benchmark --runs
+5`, and the new client-side script below, and compare against this
+matrix.
+
+**RULED OUT:**
+- 2GB RAM as a bottleneck: `rmem_max`/`wmem_max` are ceilings, not
+  per-flow multipliers, and Hysteria2/QUIC multiplexes clients over a
+  small number of listening UDP sockets, not one kernel socket per
+  client — worst case is tens of MB against 2GB total. Architecturally
+  not a risk (live swap/pressure still unmeasured on the real host, but
+  there is no plausible mechanism for this specific gap to cause it).
+- Unjustified generic sysctl tuning: none exists in the repo; scope is
+  and remains narrow by design.
+- `perf-tuning.sh` being unwired in code: it is wired into both install
+  and update paths with no parity gap. (Whether it has actually executed
+  successfully on the live production box is a *different*, still-open
+  question — see "cannot be measured" above.)
+
+### What was changed this session, and why each change is justified
+
+Given the complete absence of live measurement access, changes were
+limited to things justifiable from code/documentation evidence alone —
+diagnostic tooling and documentation gaps — not speculative tuning:
+
+1. **`deploy/local/vpn-client-diag.py`** (new) — a stdlib-only Python 3
+   script that runs on the user's actual Windows/macOS/Linux device to
+   measure DNS latency, TCP connect latency, ICMP ping loss/RTT, a
+   best-effort PMTU estimate, a baseline download-throughput sample, and
+   public exit IP, tagged by run label (`baseline`/`reality`/
+   `hysteria2`). This is the one piece of tooling explicitly missing:
+   `vpn-benchmark.sh` measures only the VPS's own uplink and says so
+   explicitly in its own comments (layer 4 is a same-host hairpin, not a
+   real client path). Collects no secrets — never reads a subscription
+   URL, token, or key. See `docs/clients/CLIENT_DIAGNOSTICS.md` for
+   methodology.
+2. **`vpn doctor --performance`: added a conntrack utilization section**
+   (`apps/admin/src/main.rs`) — reads
+   `net.netfilter.nf_conntrack_max`/`nf_conntrack_count` and warns above
+   80% utilization. This is observability only; the sysctl itself was
+   **deliberately not changed** (see below) — this closes the "cannot be
+   measured" gap on conntrack without guessing a new ceiling value.
+3. **`docs/TELEGRAM_RESILIENCE_PLAN.md` §K: added a rollback section**
+   for the multi-node design. This was a real, previously-acknowledged
+   gap (credential isolation, updates, and health-check limits were all
+   discussed; rollback was not) found during this session's audit of why
+   the multi-node scaffolding was reverted. Fixing a documented gap in an
+   existing design doc is justified regardless of production access;
+   writing new multi-node *code* is not (see below).
+
+### What was deliberately NOT changed, and why
+
+- **`nf_conntrack_max` was not raised.** The plausible-risk finding above
+  is real, but this repository's own prior work already drew the correct
+  line here ("no evidence... speculative tuning without evidence would
+  violate the explicit 'no unjustified tweaks' constraint") and this
+  session found no new evidence to cross that line — only a stronger
+  articulation of the same unmeasured risk. Observability (item 2 above)
+  was added instead so a future run with real access can decide from
+  data, not a guess.
+- **`Nice=-5` was not replaced with `CPUWeight=`.** A safer cgroup-native
+  alternative exists in principle, but `Nice=-5` already has documented
+  upstream rationale (Hysteria2 performance guide) and no measured
+  evidence of sshd/systemd starvation exists to justify changing a
+  working, already-conservative choice speculatively.
+- **No multi-node code was written.** No measurement in this session (or
+  available to it) shows CPU, not peering/ASN quality, is the actual
+  ceiling — and §K's own zero-code interim mitigation (two independent
+  deployments, two subscription URLs) already covers the "what if this
+  VPS gets blocked" case without new credential-isolation code. Building
+  the Option A merge layer speculatively, without first confirming via
+  `docs/AWS_REACHABILITY_TEST.md`-style testing that peering is actually
+  the limiting factor, would repeat the exact mistake the original
+  revert was correcting.
+- **No split-tunneling/domestic-bypass routing was added.** The
+  subscription being full-tunnel is confirmed, and Russian ISPs blocking
+  foreign QUIC is real evidence that *some* routing change could help —
+  but this repository has no maintained GeoIP/GeoSite domestic rule set,
+  and a naive `.ru`-direct rule was explicitly ruled out as unsafe by the
+  task's own framing (many non-RU services use `.ru`; many RU services
+  don't). Building this properly needs a maintained rule-set source and
+  its own privacy-tradeoff review — out of scope to improvise this
+  session without evidence of which specific domestic services are
+  actually the ones users want faster.
+- **No VPS resize, no AmneziaWG adoption, no protocol change.** None of
+  these are supported by a measurement this session could take; see the
+  closing summary below for the explicit unresolved status of each.
+
+### Rollback instructions for this session's changes
+
+- `deploy/local/vpn-client-diag.py`, `docs/clients/CLIENT_DIAGNOSTICS.md`:
+  pure additions, delete the files to remove.
+- `vpn doctor --performance` conntrack section: revert the diff in
+  `apps/admin/src/main.rs`; no state is written, purely additive output.
+- `docs/TELEGRAM_RESILIENCE_PLAN.md` §K rollback subsection: documentation
+  only, revert the diff to remove.
+None of these changes touch installed sysctls, systemd units, or
+firewall state — there is nothing to roll back on a live host.
+
+### Closing summary
+
+- **Primary bottleneck**: unproven from this environment. The strongest
+  evidence-backed candidate is **Russian ISP-side QUIC/UDP-443
+  interference against Hysteria2** (documented against multiple major RU
+  ISPs), not server CPU — but this repository has no live measurement to
+  confirm it applies to this specific deployment's users.
+- **Secondary bottleneck**: possible Hysteria2/quic-go CPU ceiling on 1
+  vCPU at high throughput (qualitatively real per upstream docs, no
+  measured threshold), and/or REALITY's TCP-based head-of-line blocking
+  on a lossy path (generic protocol property, not measured here).
+- **1 vCPU**: still unproven — no CPU/steal measurement exists during
+  real load. Do not resize preemptively; run `vpn doctor --performance`
+  during a real transfer first.
+- **2 GB RAM**: sufficient — ruled out architecturally (ceilings, not
+  per-flow multipliers); no plausible mechanism in this codebase for RAM
+  to be the limit.
+- **Protocol recommendation**: keep `Reliability` (VLESS+REALITY) as the
+  default — this was already correct and is now confirmed intentional,
+  not accidental. Offer Hysteria2 as the explicit fallback it already is,
+  but do not assume it is "the fast one" for Russian users specifically
+  given the QUIC-blocking evidence above.
+- **VPS/network recommendation**: do not resize for CPU without a
+  measurement. If/when real data shows peering or QUIC-blocking (not
+  CPU) is the ceiling, a second independent node/provider is the more
+  promising lever than more vCPUs — the design for that already exists
+  in `docs/TELEGRAM_RESILIENCE_PLAN.md` §K and is not blocked on more
+  code, only on evidence that it's needed.
+- **Measured improvement**: none — no production measurement was
+  possible in this session. What shipped is diagnostic capability
+  (client-side script, conntrack observability) and two documentation
+  fixes, not a performance change.
+- **Remaining unverified items**: essentially everything requiring a
+  real VPS or a Russia-side vantage point — actual CPU/steal under load,
+  whether kernel tuning is actually active on the live host, real
+  RU→VPS loss/jitter/UDP treatment, ASN/peering quality, and real
+  sustained bandwidth for any future Brutal configuration. Run `vpn
+  doctor --performance`, `vpn-benchmark --runs 5`, and
+  `deploy/local/vpn-client-diag.py` (from an actual Russia-side device)
+  to close these.

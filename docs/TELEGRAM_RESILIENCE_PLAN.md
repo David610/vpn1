@@ -469,6 +469,45 @@ This requires no new code, no new trust boundary, and no schema change
 do we do if this VPS gets blocked" until Option A above is built
 properly.
 
+### Rollback (gap identified 2026-08-12, addressed here)
+
+This section originally covered credential isolation, updates, and
+health-check limits for Option A, but never addressed rollback — a real
+gap flagged by a later performance-focused audit of this plan. Recorded
+here so a future Option A implementation doesn't have to re-derive it:
+
+- **Merging-layer rollback is inherently cheap, by construction.** Because
+  Option A keeps each node's `install.sh`/`vpn-admin` completely
+  unmodified and the merge step is a separate, thin, stateless service
+  that only *reads* each node's already-public subscription data, the
+  merge layer itself has no persistent state to roll back — reverting it
+  to a previous version (or removing it entirely) cannot corrupt or
+  desynchronize either node, because neither node depends on the merge
+  layer's existence to keep serving its own users.
+- **Per-node rollback is just single-node rollback, already covered.**
+  Since each node is an independent, unmodified deployment, rolling back
+  a bad `vpn1` update on Node B (e.g. via the existing
+  `deploy/almalinux/update.sh` version-pin/reinstall path, or
+  `deploy/lib/perf-tuning.sh rollback` for kernel tuning specifically)
+  never touches Node A or the merge layer's config. This is a direct
+  consequence of rejecting Option B (shared/replicated identity) above —
+  there is no cross-node state for a rollback to get half-applied to.
+- **Adding a node is reversible without a code change.** Per "What works
+  today" above, the zero-code interim mitigation (two independent
+  deployments, two subscription URLs) means a bad or unreachable Node B
+  can simply be decommissioned and its subscription URL withdrawn,
+  leaving Node A users completely unaffected — this is true whether or
+  not the merge layer from Option A has been built yet.
+- **What a merge-layer rollback plan would still need to define, before
+  Option A ships**, is out of scope for this document to invent
+  unilaterally and belongs in that follow-up session's own review: which
+  git ref/tag the merge service pins per node (so "roll back the merge
+  layer" and "roll back a node" stay independent operations), and how an
+  operator distinguishes "Node B is intentionally being rolled back" from
+  "Node B silently went unreachable" in the merged subscription's
+  behavior (both must not, e.g., silently drop Node B's users to a
+  broken selector entry).
+
 ### 2026-08 addendum: fresh research on the open questions above
 
 A follow-up investigation (iPhone/Telegram/Russia resilience pass,

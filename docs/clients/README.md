@@ -20,6 +20,11 @@ the subscription URL/QR carries everything the client needs.
 | Linux | Hiddify | [HIDDIFY_LINUX.md](HIDDIFY_LINUX.md) |
 | Windows / macOS | Hiddify | See [HIDDIFY_LINUX.md](HIDDIFY_LINUX.md) — the desktop app is the same across all three desktop OSes; menu labels are near-identical. Windows/macOS-specific quirks have not been observed/tested and are not claimed here. |
 
+See [CLIENT_DIAGNOSTICS.md](CLIENT_DIAGNOSTICS.md) for a small
+cross-platform script to measure your own real network path to the VPN
+server (latency, loss, throughput, PMTU) — useful when performance
+feels wrong and you want data to compare, not guesses.
+
 See `docs/DEVICE_ACCEPTANCE_TESTS.md` for the honest per-platform
 validation status (none of these have been tested against a real device
 in this development environment — see that document for exactly what

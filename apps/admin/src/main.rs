@@ -2921,6 +2921,33 @@ fn cmd_doctor_performance() -> Result<()> {
         perf_read("/proc/sys/net/core/wmem_max"),
     );
 
+    println!("\nConnection tracking (firewalld/ufw run stateful conntrack; exhaustion silently drops packets with no application-level error)");
+    let conntrack_max = perf_read("/proc/sys/net/netfilter/nf_conntrack_max");
+    let conntrack_count = perf_read("/proc/sys/net/netfilter/nf_conntrack_count");
+    perf_line("nf_conntrack_max", conntrack_max.clone());
+    perf_line(
+        "nf_conntrack_count (current tracked connections)",
+        conntrack_count.clone(),
+    );
+    match (
+        conntrack_count
+            .as_deref()
+            .and_then(|s| s.parse::<u64>().ok()),
+        conntrack_max.as_deref().and_then(|s| s.parse::<u64>().ok()),
+    ) {
+        (Some(count), Some(max)) if max > 0 => {
+            let pct = (count as f64 / max as f64) * 100.0;
+            println!("  utilisation: {pct:.1}%");
+            if pct >= 80.0 {
+                println!(
+                    "  WARNING: conntrack table is {pct:.1}% full — approaching exhaustion \
+                     silently drops new connections. Consider raising nf_conntrack_max."
+                );
+            }
+        }
+        _ => println!("  utilisation: unavailable (nf_conntrack module not loaded?)"),
+    }
+
     println!("\nProtocol error counters (cumulative since boot — compare two runs, not the absolute value)");
     if let Ok(snmp) = std::fs::read_to_string("/proc/net/snmp") {
         let field = |proto_prefix: &str, field_name: &str| -> Option<String> {
