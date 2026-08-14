@@ -842,6 +842,251 @@ fn each_credential_mutation_states_its_own_blast_radius() {
     );
 }
 
+/// Checkpoint 7 §4: `vpn user revoke` must be the one clear emergency
+/// command — disable the user, apply live, and verify (not just assert)
+/// that VPN access is actually gone.
+#[test]
+fn revoke_disables_user_states_revocation_and_verifies_structurally() {
+    let dir = tempfile::tempdir().unwrap();
+    let singbox = fake_singbox(dir.path(), false);
+    let cfg_path = write_deployment_toml_with_singbox(dir.path(), &singbox);
+    let systemctl = fake_systemctl(dir.path());
+    let log_path = dir.path().join("systemctl.log");
+    let augmented_path = std::env::join_paths(
+        std::iter::once(systemctl.parent().unwrap().to_path_buf()).chain(
+            std::env::var_os("PATH")
+                .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| -> assert_cmd::assert::Assert {
+        admin(dir.path(), &cfg_path)
+            .args(args)
+            .env("PATH", &augmented_path)
+            .env("SYSTEMCTL_LOG", &log_path)
+            .assert()
+    };
+    run(&["init"]).success();
+    let output = run(&["user", "create", "--name", "leo"]).success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let id = stdout
+        .lines()
+        .skip_while(|l| *l != "User ID:")
+        .nth(1)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let output = run(&["user", "revoke", &id]).success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("VPN access revoked.")
+            && stdout
+                .contains("Existing imported profiles for this user are no longer authorized."),
+        "revoke must print the unambiguous emergency-revocation statement:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Verified: the live sing-box authorization config no longer contains"),
+        "revoke must structurally verify the credential is absent from the live config:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("reset-credentials"),
+        "revoke must point the operator at the reissue command:\n{stdout}"
+    );
+
+    let output = run(&["user", "list"]).success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains(&format!("{id:<20} leo              no")));
+}
+
+/// Companion: without a live sing-box/systemctl, revoke must not claim
+/// VPN access was actually revoked — the exact overclaim
+/// `credential_mutation_does_not_claim_blast_radius_when_not_reloaded_live`
+/// below guards for every other mutating command.
+#[test]
+fn revoke_does_not_claim_revocation_when_not_reloaded_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = write_deployment_toml(dir.path()); // no real sing-box binary
+    let output = admin(dir.path(), &cfg_path)
+        .args(["user", "create", "--name", "mallory"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let id = stdout
+        .lines()
+        .skip_while(|l| *l != "User ID:")
+        .nth(1)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let output = admin(dir.path(), &cfg_path)
+        .args(["user", "revoke", &id])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(
+        !stdout.contains("VPN access revoked."),
+        "revoke must not claim success when the change was never reloaded live:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("NOT yet revoked"),
+        "revoke must say access is not yet revoked when not reloaded live:\n{stdout}"
+    );
+}
+
+/// Checkpoint 7 §5: `vpn user reset-credentials` must rotate VLESS UUID,
+/// Hysteria2 password, AND subscription token together, re-enable the
+/// user only once live, and leave deployment-wide REALITY keys and
+/// unrelated users completely untouched.
+#[test]
+fn reset_credentials_rotates_everything_needed_and_leaves_reality_and_other_users_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let singbox = fake_singbox(dir.path(), false);
+    let cfg_path = write_deployment_toml_with_singbox(dir.path(), &singbox);
+    let systemctl = fake_systemctl(dir.path());
+    let log_path = dir.path().join("systemctl.log");
+    let augmented_path = std::env::join_paths(
+        std::iter::once(systemctl.parent().unwrap().to_path_buf()).chain(
+            std::env::var_os("PATH")
+                .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| -> assert_cmd::assert::Assert {
+        admin(dir.path(), &cfg_path)
+            .args(args)
+            .env("PATH", &augmented_path)
+            .env("SYSTEMCTL_LOG", &log_path)
+            .assert()
+    };
+    run(&["init"]).success();
+    let reality_public_before =
+        std::fs::read_to_string(dir.path().join("state/reality/public.key")).unwrap();
+
+    let extract_id = |output: assert_cmd::assert::Assert| -> String {
+        let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+        stdout
+            .lines()
+            .skip_while(|l| *l != "User ID:")
+            .nth(1)
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    let target_id = extract_id(run(&["user", "create", "--name", "nora"]));
+    let other_id = extract_id(run(&["user", "create", "--name", "oscar"]));
+
+    let users_json_path = dir.path().join("state/users/users.json");
+    let read_users = |path: &std::path::Path| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    };
+    let find = |doc: &serde_json::Value, id: &str| -> serde_json::Value {
+        doc["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    let before = read_users(&users_json_path);
+    let target_before = find(&before, &target_id);
+    let other_before = find(&before, &other_id);
+
+    run(&["user", "revoke", &target_id]).success();
+    let output = run(&["user", "reset-credentials", &target_id]).success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("fresh credentials issued and applied")
+            && stdout.contains("User is enabled."),
+        "reset-credentials must confirm the new credentials are live and the user re-enabled:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("New Hiddify subscription URL for"),
+        "reset-credentials must print a new subscription URL:\n{stdout}"
+    );
+
+    let after = read_users(&users_json_path);
+    let target_after = find(&after, &target_id);
+    let other_after = find(&after, &other_id);
+
+    assert_eq!(target_after["enabled"], serde_json::json!(true));
+    assert_ne!(
+        target_after["vless_uuid"], target_before["vless_uuid"],
+        "VLESS UUID must rotate"
+    );
+    assert_ne!(
+        target_after["subscription_token_hash_hex"], target_before["subscription_token_hash_hex"],
+        "subscription token must rotate"
+    );
+    assert_ne!(
+        target_after["hysteria2_password"], target_before["hysteria2_password"],
+        "Hysteria2 password must rotate"
+    );
+    assert_eq!(
+        other_after, other_before,
+        "reset-credentials must not touch an unrelated user"
+    );
+
+    let reality_public_after =
+        std::fs::read_to_string(dir.path().join("state/reality/public.key")).unwrap();
+    assert_eq!(
+        reality_public_after, reality_public_before,
+        "reset-credentials must never rotate deployment-wide REALITY keys"
+    );
+}
+
+/// Checkpoint 7 §5: a degraded (not-live) reset-credentials must never
+/// leave the user enabled with credentials the running server hasn't
+/// actually picked up.
+#[test]
+fn reset_credentials_leaves_user_disabled_when_not_reloaded_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = write_deployment_toml(dir.path()); // no real sing-box binary
+    let output = admin(dir.path(), &cfg_path)
+        .args(["user", "create", "--name", "peggy"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let id = stdout
+        .lines()
+        .skip_while(|l| *l != "User ID:")
+        .nth(1)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let output = admin(dir.path(), &cfg_path)
+        .args(["user", "reset-credentials", &id])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("left DISABLED"),
+        "a degraded reset-credentials must leave the user disabled, never enabled with unapplied \
+         credentials:\n{stdout}"
+    );
+
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("state/users/users.json")).unwrap(),
+    )
+    .unwrap();
+    let user = doc["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["id"] == id)
+        .unwrap();
+    assert_eq!(
+        user["enabled"],
+        serde_json::json!(false),
+        "user must remain disabled on disk after a degraded reset-credentials"
+    );
+}
+
 /// Companion to the test above: when sing-box/systemctl are NOT
 /// available (the common local/CI/dev case), the blast-radius claim
 /// must NOT be printed as fact — this is the exact overclaim an

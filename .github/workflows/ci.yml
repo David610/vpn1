@@ -139,6 +139,8 @@ jobs:
         run: bash deploy/lib/tests/test-preflight-ordering.sh
       - name: IDN/punycode domain handling tests
         run: bash deploy/lib/tests/test-idn-punycode.sh
+      - name: systemd resource-limit static regression test
+        run: bash deploy/lib/tests/test-systemd-resource-limits.sh
       - name: uninstall idempotency (real script, no-op-only environment)
         run: sudo bash deploy/lib/tests/test-uninstall-idempotency.sh
 

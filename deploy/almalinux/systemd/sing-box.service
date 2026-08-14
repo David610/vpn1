@@ -13,6 +13,25 @@ ExecStart=/usr/local/bin/sing-box run -c /etc/vpn/compat/sing-box/config.json
 Restart=on-failure
 RestartSec=2
 LimitNOFILE=65535
+# TasksMax intentionally left at systemd's own default (a percentage of
+# system-wide pid_max) rather than a hand-picked number here — that
+# default is already generous relative to <=10 users' worth of
+# connections and scales with host size, which a fixed constant would not.
+
+# Checkpoint 7 §12: a soft, proportional memory governor — NOT a hard
+# cap. `MemoryHigh` makes the kernel reclaim this cgroup's page
+# cache/reclaimable memory once it's exceeded, throttling the service
+# under real memory pressure instead of letting a runaway/leaking
+# process (or a burst of legitimate large transfers across <=10 users)
+# consume the whole host and destabilize sshd/other services. It is
+# deliberately NOT `MemoryMax` (a hard limit that OOM-kills the service
+# on breach) — there is no single safe fixed byte value across the range
+# of VPS sizes this project supports, and a hard cap that's wrong for a
+# given host would turn a memory-pressure event into a self-inflicted
+# outage. 75% is conservative headroom on even a small (512MB-1GB) VPS;
+# `vpn doctor --performance` reports current RAM/swap for operators who
+# want to size this down further for a specific host.
+MemoryHigh=75%
 
 # Modest CPU scheduling priority bump, not real-time scheduling. On a
 # 1-2 vCPU host, sing-box's Hysteria2/QUIC inbound is latency-sensitive

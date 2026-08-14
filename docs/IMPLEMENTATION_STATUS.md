@@ -56,6 +56,115 @@ and `deploy/lib/fast-gate.sh` already scope to the supported crates only.
 Splitting the workspace-wide CI jobs would touch CI trust/release
 plumbing for a runner-minutes-only win; deferred.
 
+## Checkpoint 7 (small-deployment revocation, recovery, operational hardening) — completed this session
+
+- **New `vpn-admin user revoke <id>`**: the one clear emergency command
+  for a leaked/compromised user (Checkpoint 7 §4). Disables the user,
+  applies+reloads live through the existing fail-closed
+  `apply_users_and_save` transaction, then verifies the result instead of
+  only asserting it: reads the just-applied live config back to confirm
+  the user's VLESS UUID/Hysteria2 password are structurally absent, and
+  where a sing-box binary is available, actually runs a real REALITY
+  handshake self-test using the revoked user's OLD VLESS UUID and
+  confirms the live server rejects it (reusing the existing
+  `run_reality_client_selftest` harness `doctor --protocol` already
+  used). Prints exactly `VPN access revoked.` / `Existing imported
+  profiles for this user are no longer authorized.` only once the reload
+  actually succeeded — never when degraded/not-live. Mints no credential.
+- **New `vpn-admin user reset-credentials <id> [--qr]`**: the recovery/
+  reissue half (Checkpoint 7 §5). Rotates VLESS UUID + Hysteria2 password
+  + subscription token together (the complete set needed to invalidate
+  every previously imported profile), applies+reloads live, and only
+  enables the user once that succeeded — a degraded (not-live) apply
+  reverts the enabled bit back to `false` on disk rather than leaving the
+  user "enabled" with credentials the running server hasn't actually
+  picked up. Deployment-wide REALITY keys and the shared Hysteria2
+  obfuscation password are deliberately untouched (separate, wider-blast-
+  radius commands already exist for those: `init --rotate`,
+  `hysteria-obfs-rotate`).
+- **Existing `disable`/`rotate-token`/`rotate-vless`/`rotate-hysteria`/
+  `rotate-credentials` were audited, not rewritten**: their blast-radius
+  wording (added in a prior session) already correctly states what does
+  and does not change per command, including `rotate-token`'s existing
+  explicit "does NOT change the VLESS UUID or Hysteria2 password"
+  warning — left unchanged, confirmed adequate by re-reading against
+  Checkpoint 7 §6's requirement.
+- **Disabled/expired-user exclusion (Checkpoint 7 §8/§9) audited, found
+  already correct**: `render_singbox_server_config` already filters
+  `users.iter().filter(|u| u.is_active(now_unix))` — a disabled or
+  expired user is unconditionally absent from the live authorization
+  config, not something `revoke`/`reset-credentials` had to newly
+  implement. `services/subscription` already returns a generic 404 for a
+  disabled user's token (existing tests:
+  `disabled_user_token_returns_404_not_a_distinguishable_error`).
+  `vpn-expiry-reconcile.timer` already runs
+  `render-config --require-applied` every minute, which already fails
+  the unit (visible in `systemctl status`/`doctor`) if reconciliation
+  cannot actually apply. None of this needed changing — reused as-is.
+- **`vpn doctor`: two new checks**. (1) Subscription HTTPS certificate
+  expiry (`/etc/letsencrypt/live/<subscription_host>/fullchain.pem`) —
+  previously only the Hysteria2 certificate was checked; the subscription
+  reverse-proxy cert (a separate lineage, see the "Two independent TLS
+  certificates" doc note) had no visibility at all. WARN <14 days, FAIL
+  if expired, WARN (not FAIL) if absent (a valid state before the
+  operator provisions it). (2) Disk-free-space diagnostic (`[RES]` tag,
+  new — not one of the existing L1-L6 protocol layers), via a real
+  `statvfs(2)` call (`disk_free_bytes()`) on the filesystem backing
+  `/etc/vpn`: OK >=1GiB, WARN 256MiB-1GiB, WARN (not FAIL — vpn1 does not
+  stop a running server over disk space alone) <256MiB.
+- **Systemd resource hardening (Checkpoint 7 §10-12)**: added
+  `MemoryHigh=75%` (a soft, proportional-to-host-size reclaim governor,
+  NOT a hard `MemoryMax` — there is no single safe fixed byte value
+  across the VPS sizes this project supports, see the unit files' own
+  comments) to both `sing-box.service` and `vpn-subscription.service`.
+  `LimitNOFILE=65535` (sing-box), `Restart=on-failure`/`RestartSec=2`
+  (both), and `TasksMax` at systemd's own scaling default were all
+  already present/sufficient — audited, not changed.
+- **Backup/restore security (Checkpoint 7 §19/§20) audited, found already
+  correct**: `cmd_backup` creates the archive mode `0600` via
+  `OpenOptions::create_new` (refuses to clobber a pre-existing file or
+  follow a symlink), prints an explicit "contains secrets" label, and
+  never logs its contents; `cmd_restore` already validates (parses,
+  rejects symlink/FIFO/device entries, checks the REALITY keypair
+  cryptographically) before applying anything, through the same
+  render→validate→apply→reload→rollback path as every other mutating
+  command. No changes made — confirmed by the existing
+  `backup_then_restore_round_trips_users`,
+  `restore_never_widens_permissions_on_restored_secrets`,
+  `restore_rejects_archive_containing_a_symlink`, and
+  `backup_refuses_to_clobber_a_preexisting_destination` tests, which
+  still pass.
+- **Docs**: `docs/RECOVERY.md` gained a top-of-file incident playbook
+  (scenarios A-D: one user leaked, subscription endpoint blocked, server
+  broken but SSH works, server/IP lost — the last pointing at the
+  existing full VPS-loss procedure) and an explicit `rotate-token` vs.
+  `revoke` comparison table. `docs/ALMALINUX_DEPLOYMENT.md`'s credential-
+  rotation table and "Disabling / removing a user" section were updated
+  to reference `revoke`/`reset-credentials` and restate the same
+  distinction; its `doctor` section now mentions the new cert/disk checks.
+- **New tests**: 4 CLI tests in `apps/admin/tests/cli.rs`
+  (`revoke_disables_user_states_revocation_and_verifies_structurally`,
+  `revoke_does_not_claim_revocation_when_not_reloaded_live`,
+  `reset_credentials_rotates_everything_needed_and_leaves_reality_and_other_users_unchanged`,
+  `reset_credentials_leaves_user_disabled_when_not_reloaded_live`) and 2
+  unit tests for `disk_free_bytes()` in `main.rs` — all `VERIFIED-TEST`
+  (real, if faked/mocked, sing-box+systemctl; `disk_free_bytes` compared
+  against real `df` output). New shell test
+  `deploy/lib/tests/test-systemd-resource-limits.sh`, wired into
+  `.github/workflows/ci.yml`'s `shell` job and picked up automatically by
+  `deploy/lib/fast-gate.sh`'s glob.
+- **What was deliberately NOT done**: no quota/traffic-accounting system,
+  no per-user database, no DPI/abuse scoring, no protocol changes,
+  `cargo audit`/full-workspace `cargo test`/real-VPS runs were not
+  re-executed this checkpoint beyond the crates actually touched
+  (`admin`) — see Verification below for exactly what ran.
+- **UNVERIFIED** (no disposable AlmaLinux 9 host/real device available
+  this session): a real Hiddify/sing-box client actually losing/regaining
+  connectivity as a direct result of `revoke`/`reset-credentials`; the
+  `MemoryHigh=75%` governor's real effect under actual memory pressure on
+  a live host; the disk-space/cert-expiry doctor checks against a real
+  `/etc/letsencrypt` layout.
+
 ## Checkpoint 6 (release/bootstrap/documentation consistency, first-release readiness) — completed this session
 
 Audit found the release contract itself (installer/updater/CI agreement on

@@ -260,6 +260,38 @@ enum UserCommands {
     Disable {
         user_id: String,
     },
+    /// Emergency incident command: immediately stop this user's VPN
+    /// access. Disables the user (same effect as `disable`, worded for
+    /// the incident-response case a leaked credential actually is),
+    /// applies + reloads the live sing-box authorization, then verifies
+    /// — as strongly as this host can — that the OLD credentials no
+    /// longer authenticate: structurally, by confirming they are absent
+    /// from the just-applied config; and where a sing-box binary and
+    /// another active user exist to test with, by actually running a
+    /// throwaway REALITY handshake using the revoked user's OLD VLESS
+    /// UUID and confirming the server rejects it. Does not mint any new
+    /// credential — see `reset-credentials` for reissuing safely
+    /// afterward.
+    Revoke {
+        user_id: String,
+    },
+    /// Recovery/reissue flow for a user after `revoke` (or any other
+    /// suspected credential compromise): rotates the VLESS UUID,
+    /// Hysteria2 password, AND subscription token together — the
+    /// complete set needed to invalidate every previously imported
+    /// profile for this user — applies + reloads live, and only then
+    /// re-enables the user. Deployment-wide REALITY keys and the shared
+    /// Hysteria2 obfuscation password are deliberately NOT touched (use
+    /// `init --rotate` / `hysteria-obfs-rotate` separately if the
+    /// compromise is deployment-wide, not one user). On any failure the
+    /// user is left disabled rather than enabled with half-rotated
+    /// credentials.
+    ResetCredentials {
+        user_id: String,
+        /// Print a terminal QR code of the new subscription URL.
+        #[arg(long)]
+        qr: bool,
+    },
     RotateToken {
         user_id: String,
         /// Print a terminal QR code of the new subscription URL.
@@ -371,6 +403,10 @@ fn main() -> Result<()> {
         }
         Commands::User(UserCommands::Disable { user_id }) => {
             cmd_user_set_enabled(&cfg, &user_id, false)
+        }
+        Commands::User(UserCommands::Revoke { user_id }) => cmd_user_revoke(&cfg, &user_id),
+        Commands::User(UserCommands::ResetCredentials { user_id, qr }) => {
+            cmd_user_reset_credentials(&cfg, &user_id, qr)
         }
         Commands::User(UserCommands::RotateToken { user_id, qr }) => {
             cmd_user_rotate_token(&cfg, &user_id, qr)
@@ -1832,6 +1868,173 @@ fn cmd_user_set_enabled(cfg: &DeploymentConfig, id: &str, enabled: bool) -> Resu
     Ok(())
 }
 
+/// `vpn-admin user revoke ID`: the one clear emergency command for a
+/// leaked/compromised user profile (Checkpoint 7 §4). Semantically the
+/// same live effect as `disable`, but verifies the result as strongly as
+/// this host practically can instead of only asserting it, and its
+/// output is unambiguous about what "revoked" actually means here — see
+/// `cmd_user_set_enabled`'s existing output for why `disable` alone
+/// already gets this right operationally; this command additionally:
+/// (1) confirms the just-applied live config no longer contains the
+/// user's VLESS UUID/Hysteria2 password by reading it back, and (2)
+/// where a sing-box binary is available, actually attempts a real
+/// REALITY handshake using the revoked user's OLD VLESS UUID and
+/// confirms the live server rejects it — proof, not inference. Mints no
+/// new credential; see `cmd_user_reset_credentials` for reissuing.
+fn cmd_user_revoke(cfg: &DeploymentConfig, id: &str) -> Result<()> {
+    let mut users = store::load_users(&cfg.users_file())?;
+    let previous_users = users.clone();
+    find_user_mut(&mut users, id)?.enabled = false;
+    let went_live = apply_users_and_save(cfg, &previous_users, &users)?;
+
+    if !went_live {
+        println!("{id}: disabled on disk, but NOT reloaded live (see the warning above).");
+        println!(
+            "VPN access is NOT yet revoked — the running server still accepts this user's \
+             credentials until a real reload succeeds. Re-run `vpn-admin user revoke {id}` once \
+             that's fixed; do not treat this user as revoked yet."
+        );
+        return Ok(());
+    }
+
+    let revoked = users
+        .iter()
+        .find(|u| u.id == id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no such user: {id}"))?;
+
+    println!("VPN access revoked.");
+    println!("Existing imported profiles for this user are no longer authorized.");
+    println!();
+
+    let config_text = std::fs::read_to_string(cfg.singbox_config_file()).ok();
+    let vless_absent = config_text
+        .as_deref()
+        .map(|t| !t.contains(&revoked.vless_uuid))
+        .unwrap_or(false);
+    let hysteria_absent = config_text
+        .as_deref()
+        .map(|t| !t.contains(revoked.hysteria2_password.expose()))
+        .unwrap_or(false);
+    if vless_absent && hysteria_absent {
+        println!(
+            "Verified: the live sing-box authorization config no longer contains this user's \
+             VLESS UUID or Hysteria2 password."
+        );
+    } else {
+        println!(
+            "WARNING: could not confirm the live config excludes this user's credentials by \
+             reading it back — investigate with `vpn-admin doctor` before treating this as safe."
+        );
+    }
+
+    match load_reality_params(cfg) {
+        Ok(reality) => {
+            match run_reality_client_selftest(cfg, &reality, &revoked, cfg.reality.listen_port) {
+                Ok(RealitySelfTestOutcome::HandshakeRejected) => println!(
+                    "Verified: a real REALITY handshake attempt using this user's OLD VLESS UUID \
+                     was rejected by the live server."
+                ),
+                Ok(RealitySelfTestOutcome::Pass) => {
+                    bail!(
+                        "REVOCATION VERIFICATION FAILED: a real REALITY handshake using this \
+                         user's OLD VLESS UUID SUCCEEDED against the live server. The user is \
+                         marked disabled on disk, but the running server still authenticates \
+                         their old credentials — do NOT treat this user as revoked. Run \
+                         `vpn-admin doctor --protocol` and investigate immediately."
+                    );
+                }
+                Ok(RealitySelfTestOutcome::Inconclusive) | Err(_) => println!(
+                    "UNVERIFIED: a real handshake-rejection self-test could not reach a definite \
+                     result this run (inconclusive, or the harness itself failed) — this does \
+                     NOT indicate a problem, but real-protocol rejection of the old VLESS \
+                     credential was not proven. The structural config check above is what's \
+                     actually verified. There is no equivalent Hysteria2 handshake-rejection \
+                     self-test in this codebase; Hysteria2 protocol-level rejection is UNVERIFIED \
+                     by this command, structural absence from the live config is what's checked."
+                ),
+            }
+        }
+        Err(_) => println!(
+            "UNVERIFIED: could not load REALITY key material to run a real handshake-rejection \
+             self-test — the structural config check above is what's actually verified."
+        ),
+    }
+
+    println!();
+    println!("To issue this user fresh credentials: vpn-admin user reset-credentials {id}");
+    Ok(())
+}
+
+/// `vpn-admin user reset-credentials ID`: the recovery/reissue half of
+/// the incident workflow (Checkpoint 7 §5), normally run after `revoke`.
+/// Rotates the VLESS UUID, Hysteria2 password, AND subscription token
+/// together (the complete set needed to invalidate every previously
+/// imported profile for this user), applies + reloads live through the
+/// same fail-closed `apply_users_and_save` transaction every other
+/// mutating command uses, and only enables the user once that succeeded
+/// — a degraded (not-live) apply leaves the user disabled on disk rather
+/// than enabled with credentials the running server hasn't actually
+/// picked up yet. Deployment-wide REALITY keys and the shared Hysteria2
+/// obfuscation password are deliberately untouched.
+fn cmd_user_reset_credentials(cfg: &DeploymentConfig, id: &str, qr: bool) -> Result<()> {
+    let mut users = store::load_users(&cfg.users_file())?;
+    let previous_users = users.clone();
+    let token = credentials::generate_subscription_token();
+    let hash = credentials::hash_token(&token);
+    {
+        let u = find_user_mut(&mut users, id)?;
+        u.vless_uuid = credentials::generate_uuid_v4();
+        u.hysteria2_password = SecretString::new(credentials::generate_hysteria2_password());
+        u.subscription_token_hash_hex = hash;
+        u.enabled = true;
+    }
+    let went_live = apply_users_and_save(cfg, &previous_users, &users)?;
+
+    if !went_live {
+        // apply_users_and_save already wrote the new (enabled=true,
+        // rotated) record to disk even though the live reload degraded
+        // rather than failed outright (e.g. no systemctl/sing-box on
+        // this host) — correct the enabled bit back to false immediately
+        // so this user is never left "enabled" on disk while the
+        // running server has not actually picked up the new credentials.
+        if let Some(u) = users.iter_mut().find(|u| u.id == id) {
+            u.enabled = false;
+        }
+        store::save_users_atomic(&cfg.users_file(), &users)
+            .context("reverting enabled=false after a degraded (not-live) credential reset")?;
+        println!(
+            "{id}: fresh credentials generated, but NOT reloaded live (see the warning above)."
+        );
+        println!(
+            "This user has been left DISABLED rather than enabled with unapplied credentials. \
+             Fix the reload issue, confirm with `vpn-admin doctor` that the new config is \
+             actually live, then run `vpn-admin user enable {id}`."
+        );
+        return Ok(());
+    }
+
+    let url = subscription_url(cfg, &token);
+    println!("{id}: fresh credentials issued and applied to the running server. User is enabled.");
+    println!(
+        "The OLD VLESS UUID, Hysteria2 password, and subscription URL for this user are ALL now \
+         invalid — any previously imported profile must be replaced with the one below."
+    );
+    println!(
+        "Deployment-wide REALITY keys and the shared Hysteria2 obfuscation password were NOT \
+         touched — only this user's own credentials changed."
+    );
+    println!();
+    println!("New Hiddify subscription URL for {id}:");
+    println!("  {url}");
+    if qr {
+        println!();
+        println!("Scan this QR code in Hiddify (Add profile -> Scan QR code):");
+        print_qr(&url)?;
+    }
+    Ok(())
+}
+
 fn cmd_user_rotate_token(cfg: &DeploymentConfig, id: &str, qr: bool) -> Result<()> {
     let mut users = store::load_users(&cfg.users_file())?;
     let token = credentials::generate_subscription_token();
@@ -2230,6 +2433,39 @@ fn cert_expiry_days(path: &std::path::Path) -> Option<Result<i64, String>> {
     }
 }
 
+/// Free bytes on the filesystem containing `path`, via `statvfs(2)`.
+/// `None` if the path doesn't exist yet or the syscall fails — callers
+/// must treat that as "could not determine," never as "plenty of space."
+#[cfg(unix)]
+fn disk_free_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    // statvfs needs an existing path; walk up to the nearest existing
+    // ancestor if `path` itself hasn't been created yet (e.g. a fresh
+    // host before `/etc/vpn/compat` exists) — same filesystem in
+    // practice for every real deployment layout this project supports.
+    let existing = path
+        .ancestors()
+        .find(|p| p.exists())
+        .unwrap_or(std::path::Path::new("/"));
+    let c_path = CString::new(existing.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return None;
+    }
+    // `as u64` is a no-op on glibc (already u64) but not on every libc
+    // target (e.g. some fields are u32 elsewhere) — kept for portability
+    // rather than relying on the field's type on this specific platform.
+    #[allow(clippy::unnecessary_cast)]
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn disk_free_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckStatus {
     Ok,
@@ -2278,11 +2514,12 @@ impl ProtocolCheckResult {
 }
 
 /// `layer` is one of `"L1"` (process), `"L2"` (config/key/cert),
-/// `"L3"` (listeners/network), `"L4"` (subscription-coherence), or
-/// `"L5-6"` (real protocol handshake) — see the module-level note above
-/// `cmd_doctor` for why this labeling exists: L1-L3 all passing does
-/// NOT mean a real client can connect (that's what the incident this
-/// tagging responds to actually looked like).
+/// `"L3"` (listeners/network), `"L4"` (subscription-coherence),
+/// `"L5-6"` (real protocol handshake), or `"RES"` (host resource
+/// diagnostics — disk space — not a protocol layer, see the module-level
+/// note above `cmd_doctor` for why this labeling exists: L1-L3 all
+/// passing does NOT mean a real client can connect (that's what the
+/// incident this tagging responds to actually looked like).
 fn report_check(status: CheckStatus, layer: &str, message: impl AsRef<str>) {
     let label = match status {
         CheckStatus::Ok => "[OK]  ",
@@ -2605,6 +2842,107 @@ fn cmd_doctor(
              `vpn-admin hysteria-obfs-rotate` to enable it (every existing client must re-import \
              its Hysteria2 profile afterward).",
         );
+    }
+
+    // Subscription HTTPS certificate (certbot/Let's Encrypt, consumed by
+    // nginx — NOT the Hysteria2 cert checked above, see the "Two
+    // independent TLS certificates" note in docs/ALMALINUX_DEPLOYMENT.md).
+    // vpn-admin never provisions or renews this cert itself, so its
+    // absence is only a WARN (an install without subscription HTTPS
+    // configured yet is a valid, if incomplete, state) — but an EXPIRED
+    // or soon-to-expire one is exactly the silent failure mode a
+    // certbot-renewal regression produces, so it must be visible here,
+    // not only inferable from a client's failed subscription fetch.
+    let subscription_cert = std::path::PathBuf::from("/etc/letsencrypt/live")
+        .join(&cfg.subscription_host)
+        .join("fullchain.pem");
+    match cert_expiry_days(&subscription_cert) {
+        None => report_check(
+            CheckStatus::Warn,
+            "L2",
+            format!(
+                "subscription HTTPS certificate not present at {subscription_cert:?} — either \
+                 not provisioned yet, or certbot uses a different lineage name than \
+                 subscription_host ({:?}); see docs/ALMALINUX_DEPLOYMENT.md",
+                cfg.subscription_host
+            ),
+        ),
+        Some(Ok(days)) if days < 0 => {
+            report_check(
+                CheckStatus::Fail,
+                "L2",
+                format!("subscription HTTPS certificate EXPIRED {} day(s) ago — certbot renewal has failed; run `sudo certbot renew` and check `journalctl -u certbot.timer`", -days),
+            );
+            failures += 1;
+        }
+        Some(Ok(days)) if days < 14 => report_check(
+            CheckStatus::Warn,
+            "L2",
+            format!(
+                "subscription HTTPS certificate expires in {days} day(s) — confirm certbot's \
+                 renewal timer is active (`systemctl status certbot.timer`) before this becomes \
+                 an outage"
+            ),
+        ),
+        Some(Ok(days)) => report_check(
+            CheckStatus::Ok,
+            "L2",
+            format!("subscription HTTPS certificate valid, expires in {days} day(s)"),
+        ),
+        Some(Err(e)) => report_check(
+            CheckStatus::Warn,
+            "L2",
+            format!("could not check subscription HTTPS certificate expiry: {e}"),
+        ),
+    }
+
+    // Disk space — a small-VPS operational bound, not a guarantee: certbot
+    // renewal, a `vpn-admin update.sh` staging directory, or ordinary log
+    // growth can all fail obscurely once free space runs out, and nothing
+    // else in this command would otherwise surface that before it happens.
+    // Checked on the filesystem backing `/etc/vpn` (state/config) rather
+    // than root specifically, since that's what vpn1 itself writes to.
+    match disk_free_bytes(&cfg.state_dir) {
+        Some(free) => {
+            const GIB: u64 = 1024 * 1024 * 1024;
+            const MIB: u64 = 1024 * 1024;
+            let free_mib = free / MIB;
+            if free >= GIB {
+                report_check(
+                    CheckStatus::Ok,
+                    "RES",
+                    format!("disk free on {:?}: {free_mib} MiB", cfg.state_dir),
+                );
+            } else if free >= 256 * MIB {
+                report_check(
+                    CheckStatus::Warn,
+                    "RES",
+                    format!(
+                        "disk free on {:?}: {free_mib} MiB — getting low; a certificate \
+                         renewal, an update, or ordinary log growth could fail if this keeps \
+                         shrinking. Not a current failure.",
+                        cfg.state_dir
+                    ),
+                );
+            } else {
+                report_check(
+                    CheckStatus::Warn,
+                    "RES",
+                    format!(
+                        "disk free on {:?}: {free_mib} MiB — dangerously low. This is a WARN, \
+                         not a FAIL, because vpn1 does not stop a running server over disk space \
+                         alone, but certificate renewal and updates are likely to fail soon; \
+                         free space now.",
+                        cfg.state_dir
+                    ),
+                );
+            }
+        }
+        None => report_check(
+            CheckStatus::Warn,
+            "RES",
+            format!("could not determine free disk space on {:?}", cfg.state_dir),
+        ),
     }
 
     for name in ["sing-box", "vpn-subscription"] {
@@ -5807,6 +6145,52 @@ mod udp_probe_tests {
         assert!(
             days > 0 && days <= 90,
             "cert issued with -days 90 must report a small positive days remaining, got {days}"
+        );
+    }
+
+    /// Checkpoint 7 §14: `doctor`'s disk-space diagnostic must actually
+    /// read a real free-space number for an existing path, not a
+    /// hardcoded/fake value — proven by comparing it against `df`'s own
+    /// report for the same filesystem rather than asserting a specific
+    /// number (which would be flaky across hosts/CI runners).
+    #[test]
+    fn disk_free_bytes_matches_df_for_an_existing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = disk_free_bytes(dir.path()).expect("must return Some for an existing path");
+
+        let output = std::process::Command::new("df")
+            .args(["-k", "--output=avail"])
+            .arg(dir.path())
+            .output()
+            .expect("df must be available to run this test");
+        let text = String::from_utf8_lossy(&output.stdout);
+        let df_kib: u64 = text
+            .lines()
+            .nth(1)
+            .expect("df must print a data line")
+            .trim()
+            .parse()
+            .expect("df output must be a number");
+        let df_bytes = df_kib * 1024;
+
+        // Allow generous slack: `df` and `statvfs` can round differently
+        // and another process can allocate/free space between the two
+        // calls — this is checking "same ballpark, real syscall", not
+        // byte-exact equality.
+        let diff = ours.abs_diff(df_bytes);
+        assert!(
+            diff < df_bytes / 10 + 50 * 1024 * 1024,
+            "disk_free_bytes()={ours} too far from df's {df_bytes} for the same path"
+        );
+    }
+
+    #[test]
+    fn disk_free_bytes_walks_up_to_nearest_existing_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does/not/exist/yet");
+        assert!(
+            disk_free_bytes(&missing).is_some(),
+            "a not-yet-created path must still resolve via its nearest existing ancestor"
         );
     }
 

@@ -388,12 +388,32 @@ sudo firewall-cmd --list-all
 sudo ss -tulpn
 ```
 
+## Incident: a user's credentials leaked
+
+```bash
+sudo vpn-admin user revoke user_xxxxxxxx              # stop it now
+sudo vpn-admin user reset-credentials user_xxxxxxxx --qr   # reissue safely
+```
+
+`revoke` is the one clear emergency command — see `docs/RECOVERY.md`
+section A for the full incident playbook and exactly why `rotate-token`
+alone does NOT stop an already-imported profile from connecting (it only
+stops the subscription URL from being *fetched*). `reset-credentials`
+rotates the VLESS UUID, Hysteria2 password, and subscription token
+together and only re-enables the user once that's confirmed live;
+deployment-wide REALITY keys are untouched.
+
 ## Disabling / removing a user
 
 ```bash
 sudo vpn-admin --config /etc/vpn/deployment.toml user disable user_xxxxxxxx
 sudo vpn-admin --config /etc/vpn/deployment.toml user remove user_xxxxxxxx
 ```
+
+`disable` has the identical live effect as `revoke` above — `revoke` is
+the same operation with incident-oriented output and does the extra work
+of actually trying to verify the old credentials are rejected rather than
+only asserting it.
 
 Both commands render + validate + apply the new config, then reload
 `sing-box` (`systemctl reload-or-restart`) and verify it comes back
@@ -408,16 +428,19 @@ disabled successfully" while the old credentials are still live.
 
 | What | Command | Client impact |
 |---|---|---|
-| Subscription token | `vpn-admin user rotate-token <id>` | Old subscription URL stops working; VLESS/Hysteria2 credentials unchanged, so already-connected clients using the sing-box native app config keep working until they re-fetch. |
+| Subscription token ONLY (URL fetch/refresh) | `vpn-admin user rotate-token <id>` | Old subscription URL 404s. **Does NOT revoke already-imported VLESS/Hysteria2 credentials** — they keep connecting until separately rotated/disabled. Use `user revoke` instead if the concern is an already-imported profile, not just the URL. |
+| Full incident revocation | `vpn-admin user revoke <id>` | Disables the user; both transports AND the subscription URL stop working, verified (not just asserted) live. See "Incident" above. |
+| Reissue after revoke | `vpn-admin user reset-credentials <id>` | Rotates VLESS UUID + Hysteria2 password + subscription token together, then re-enables. See "Incident" above. |
 | VLESS UUID only | `vpn-admin user rotate-vless <id>` | User must re-import; Hysteria2 credentials unaffected. |
 | Hysteria2 password only | `vpn-admin user rotate-hysteria <id>` | User must re-import; VLESS credentials unaffected. |
-| Both VLESS UUID + Hysteria2 password | `vpn-admin user rotate-credentials <id>` | User must re-import both transports. |
-| REALITY keypair | `vpn-admin init --rotate` | **Every** client using this server must re-import (spec §12/§30: high impact, do this deliberately, rarely). |
+| Both VLESS UUID + Hysteria2 password (user stays enabled throughout) | `vpn-admin user rotate-credentials <id>` | User must re-import both transports. |
+| REALITY keypair (deployment-wide) | `vpn-admin init --rotate` | **Every** client using this server must re-import (spec §12/§30: high impact, do this deliberately, rarely — do not use this for a single leaked user, see "Incident" above). |
 | TLS certificate (Hysteria2) | manual re-copy + `systemctl reload-or-restart sing-box` (see "Certificates" above) | None — same cert, just renewed. |
 | TLS certificate (subscription reverse proxy) | `certbot renew` (automatic) + `nginx -s reload` | None — reverse proxy only. |
 
-All four `rotate-*`/`disable`/`enable`/`remove` commands go through the
-same render→validate→apply→reload→verify→rollback-on-failure path.
+All `rotate-*`/`disable`/`enable`/`remove`/`revoke`/`reset-credentials`
+commands go through the same render→validate→apply→reload→verify→
+rollback-on-failure path.
 
 ## Updating
 
@@ -590,10 +613,12 @@ operator-approved edit.
 
 ## Verifying a client can actually connect, not just that the server looks healthy
 
-`vpn-admin doctor` (no flags) only checks L1-L4: process state, config/
-key/cert validity, listeners, and that the subscription service's
-rendered keys agree with what's on disk — it does **not** prove a real
-client can complete a REALITY handshake. Run:
+`vpn-admin doctor` (no flags) checks L1-L4 (process state, config/key/cert
+validity including both TLS certificates' expiry — Hysteria2's and the
+subscription reverse proxy's — listeners, and that the subscription
+service's rendered keys agree with what's on disk) plus a `[RES]` disk-
+space check on the filesystem backing `/etc/vpn` — it does **not** prove
+a real client can complete a REALITY handshake. Run:
 
 ```bash
 sudo vpn-admin doctor --protocol

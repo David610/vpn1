@@ -10,6 +10,11 @@ ExecStart=/usr/local/bin/vpn-subscription-svc --config /etc/vpn/deployment.toml
 Restart=on-failure
 RestartSec=2
 Environment=RUST_LOG=info
+# Same soft, proportional memory governor as sing-box.service (Checkpoint
+# 7 §12) — this is a small loopback-only HTTP service with no legitimate
+# reason to approach this, but a leak/bug here must not be able to
+# destabilize the rest of the host either.
+MemoryHigh=75%
 
 # Never needs to write anywhere except read the user store (read-only
 # from this service's perspective — vpn-admin, run as root, is the only
