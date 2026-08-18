@@ -202,17 +202,23 @@ pub fn render_singbox_client_subscription_with_profile(
                 "server_port": ep.port,
                 "uuid": user.vless_uuid,
                 "flow": "xtls-rprx-vision",
-                // Without this, sing-box's VLESS outbound relays UDP with
-                // no full-cone NAT support and no per-destination session
-                // multiplexing, forcing every "UDP" flow (QUIC included)
-                // through TCP-shaped semantics on top of the TCP/443
-                // REALITY connection. That head-of-line-blocks a whole
-                // QUIC flow behind ordinary TCP loss/reordering — fine for
-                // a handful of small requests, and exactly the failure
-                // shape reported for QUIC-heavy apps (sustained video
-                // playback) while plain HTTPS keeps working. "xudp" is
-                // sing-box/Xray's documented fix for VLESS+REALITY UDP
-                // relay (see sing-box's VLESS outbound docs).
+                // CORRECTION (2026-08-18): sing-box's own VLESS outbound
+                // already defaults `packet_encoding` to "xudp" ("UDP
+                // packet encoding, xudp is used by default" — sing-box's
+                // VLESS outbound docs). This field was NOT previously
+                // missing full-cone UDP relay, contrary to this
+                // project's earlier assumption. Setting it explicitly
+                // changes no runtime behavior on any sing-box version
+                // that honors its own documented default; it exists
+                // only so this deployment does not silently depend on
+                // an implicit upstream default that could change in a
+                // future sing-box release, and so a reader of this
+                // config doesn't have to know that default to know what
+                // UDP encoding is in use. This is NOT a fix for the
+                // YouTube-app-only playback bug this project
+                // investigated — the hypothesis it was meant to address
+                // is weakened, not confirmed, by this finding. See
+                // docs/CLIENT_PROTOCOL_BEHAVIOR.md's UDP/TCP section.
                 "packet_encoding": "xudp",
                 "tls": {
                     "enabled": true,
@@ -496,11 +502,13 @@ mod tests {
         assert_eq!(reality["tls"]["utls"]["fingerprint"], "chrome");
         assert_eq!(reality["tls"]["reality"]["public_key"], "abc123");
         assert_eq!(reality["tls"]["reality"]["short_id"], "0a1b2c3d");
-        // xudp is the one deliberate exception to "minimal": without it,
-        // sing-box's VLESS outbound has no full-cone UDP relay, which
-        // head-of-line-blocks QUIC-heavy traffic (video, calls) behind
-        // REALITY's TCP/443 connection — see the comment at this field's
-        // call site in render_singbox_client_subscription_with_profile.
+        // xudp is the one deliberate exception to "minimal" — pinned
+        // explicitly even though it is already sing-box's own documented
+        // default for this field, so this deployment never silently
+        // depends on an implicit upstream default. See the comment at
+        // this field's call site in
+        // render_singbox_client_subscription_with_profile for the
+        // 2026-08-18 correction of why this is defensive, not a fix.
         assert_eq!(reality["packet_encoding"], "xudp");
         let urltest = outbounds.iter().find(|o| o["type"] == "urltest").unwrap();
         assert_eq!(urltest["url"], "https://www.gstatic.com/generate_204");

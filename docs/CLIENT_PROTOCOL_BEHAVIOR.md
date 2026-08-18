@@ -82,18 +82,34 @@ assumption.
 - **VLESS+REALITY**: runs over TCP/443 by design (the REALITY disguise
   requires a real TCP TLS handshake with a decoy). Any UDP the client
   sends (including a device's own QUIC/HTTP3 traffic to third-party
-  sites) is relayed multiplexed over that same TCP connection. The
-  generated outbound sets `"packet_encoding": "xudp"` (added
-  2026-08-18) specifically so that relay gets full-cone NAT and
-  per-destination session framing instead of sing-box's legacy
-  encoding-less UDP relay — without it, every UDP "flow" (a QUIC
-  connection included) is head-of-line-blocked behind ordinary TCP
-  loss/reordering on the REALITY connection, which disproportionately
-  hurts QUIC-heavy traffic (streaming video, calls) while leaving small
-  plain-HTTPS requests unaffected. See `crates/compat-config/src/
+  sites) is relayed multiplexed over that same TCP connection, using
+  full-cone/per-destination-session (`xudp`) framing. The generated
+  outbound now sets `"packet_encoding": "xudp"` explicitly (added
+  2026-08-18) — **but this is sing-box's own documented default for
+  this field regardless**, so setting it changes no runtime behavior;
+  it exists only so this deployment does not silently depend on an
+  implicit upstream default that could change in a future sing-box
+  release. An earlier version of this document, and this project's own
+  YouTube-app playback investigation, described the field as absent and
+  treated its absence as a likely cause of that bug — that was
+  incorrect (this project had not checked sing-box's own default value
+  before writing that hypothesis), and the hypothesis is weakened, not
+  confirmed, by this correction. See `crates/compat-config/src/
   render.rs`'s `render_singbox_client_subscription_with_profile` for
-  the exact field and rationale, and `docs/PERFORMANCE_OPTIMIZATION_PLAN.md`
-  for why this was not previously set.
+  the exact field.
+- **Does this project's subscription's `packet_encoding` even reach a
+  real Hiddify iOS user**: not necessarily. `docs/clients/HIDDIFY_IOS.md`
+  documents the subscription URL handed to users as
+  `?format=hiddify`, which `services/subscription` renders identically
+  to `?format=uri` (share links: `vless://...`, `hysteria2://...`) —
+  never the native sing-box JSON (`?format=singbox`) this field lives
+  in. Whatever sing-box outbound Hiddify itself constructs from a
+  parsed `vless://` share link is entirely Hiddify's own doing, not
+  something this repository's `packet_encoding` setting can reach or
+  verify. This is not a new problem introduced by this correction —
+  MTU, DNS, and IPv6 policy were already documented above as entirely
+  client-owned for the same reason; `packet_encoding` for
+  URI/`format=hiddify` imports belongs in that same category.
 - **Hysteria2**: UDP/443 end to end (QUIC-based) — this is the entire
   point of offering it as a secondary transport. **UDP/443 is
   meaningfully more likely to be blocked, throttled, or simply

@@ -9,15 +9,15 @@ from spec conformance or code review alone.
 
 ## Matrix
 
-| Platform | Client | VLESS+REALITY | Hysteria2 | Subscription refresh | Network switch |
-|---|---|---|---|---|---|
-| iOS | Hiddify | not yet tested | not yet tested | not yet tested | not yet tested |
-| Android | Hiddify | not yet tested | not yet tested | not yet tested | not yet tested |
-| HONOR MagicOS | Hiddify | not yet tested | not yet tested | not yet tested | not yet tested |
-| Android | v2rayNG | not yet tested | N/A (unsupported/not guaranteed — see `docs/clients/V2RAYNG_ANDROID.md`) | not yet tested | not yet tested |
-| Linux | Hiddify | not yet tested | not yet tested | not yet tested | not yet tested |
-| Windows | Hiddify | not yet tested | not yet tested | not yet tested | not yet tested |
-| macOS | Hiddify | not yet tested | not yet tested | not yet tested | not yet tested |
+| Platform | Client | VLESS+REALITY | Hysteria2 | Subscription refresh | Network switch | DNS leak | Streaming (QUIC-heavy app) |
+|---|---|---|---|---|---|---|---|
+| iOS | Hiddify | not yet tested | not yet tested | not yet tested | not yet tested | not yet tested | not yet tested |
+| Android | Hiddify | not yet tested | not yet tested | not yet tested | not yet tested | not yet tested | not yet tested |
+| HONOR MagicOS | Hiddify | not yet tested | not yet tested | not yet tested | not yet tested | not yet tested | not yet tested |
+| Android | v2rayNG | not yet tested | N/A (unsupported/not guaranteed — see `docs/clients/V2RAYNG_ANDROID.md`) | not yet tested | not yet tested | not yet tested | not yet tested |
+| Linux | Hiddify | not yet tested | not yet tested | not yet tested | not yet tested | not yet tested | not yet tested |
+| Windows | Hiddify | not yet tested | not yet tested | not yet tested | not yet tested | not yet tested | not yet tested |
+| macOS | Hiddify | not yet tested | not yet tested | not yet tested | not yet tested | not yet tested | not yet tested |
 
 ## What each column means
 
@@ -32,6 +32,23 @@ from spec conformance or code review alone.
 - **Network switch**: the connection survives (or promptly reconnects
   after) switching from Wi-Fi to mobile data and back, and after a
   screen-off idle period (mobile platforms).
+- **DNS leak** (added 2026-08-18, previously had no column at all — see
+  `docs/CLIENT_PROTOCOL_BEHAVIOR.md`'s DNS section for why this project
+  cannot verify this from the server side): run a DNS-leak test (e.g.
+  https://dnsleaktest.com from the connected device) with the VPN off,
+  then again with it connected on each transport. PASS means the
+  connected result shows only resolvers associated with the VPS/its
+  provider, never the carrier's/Wi-Fi's own resolver. Record the actual
+  resolver IPs/ASNs seen in each state, not just PASS/FAIL.
+- **Streaming (QUIC-heavy app)** (added 2026-08-18, prompted by a real
+  production report of YouTube's iOS app failing to play video while
+  Safari and ordinary HTTPS worked — see that investigation's report for
+  the full hypothesis list): with each transport selected explicitly,
+  confirm actual sustained video/call playback in a QUIC-using native
+  app (e.g. YouTube), not just that the app opens or an IP-check page
+  loads. Record app name/version, whether QUIC could be forced off in
+  that app or at the network level for comparison, and whether the
+  result differs between transports.
 
 ## How to actually run this
 
