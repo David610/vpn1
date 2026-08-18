@@ -352,3 +352,81 @@ censorship — there is no way to verify that from outside Russia.
       failures reproduce identically on `main` without this pass's
       changes — a missing `vpn-subscription` system group in this
       sandbox, not a regression).
+
+## Phase 16 — YouTube-app playback investigation follow-up
+
+Prompted by a real production report: iPhone + Hiddify, YouTube's native
+app failed to play video over both VLESS+REALITY and Hysteria2 while
+Safari and ordinary HTTPS worked. See the accompanying diagnosis
+(35-hypothesis classification, ranked experiments) for full detail; this
+phase implements what could be safely, honestly fixed from the repo
+alone — no real device or packet capture was available.
+
+- [x] Hysteria2 has never had a live protocol self-test — `vpn doctor
+      --protocol` dialed only REALITY's TCP/443 handshake with a real
+      throwaway sing-box client; there was no Hysteria2/QUIC equivalent
+      at all, so a Hysteria2-only regression (wrong on-disk password,
+      a listener that opens the UDP port but never completes a QUIC
+      handshake, a sing-box UDP/QUIC defect) could pass every existing
+      health check. Added `check_l5_l6_hysteria2_protocol_selftest` /
+      `run_hysteria2_client_selftest` (`apps/admin/src/main.rs`),
+      reported as its own "L5-6-H2" line, gated the same way as the
+      REALITY self-test (`--protocol` / `--require-protocol`). Kept
+      deliberately coarser than REALITY's outcome (`Pass` /
+      `Inconclusive` only, never a confident "rejected" verdict) because
+      this project has not catalogued sing-box's exact client-side error
+      string for a Hysteria2 authentication failure — see
+      `Hysteria2SelfTestOutcome`'s doc comment.
+- [x] `packet_encoding: "xudp"` pinned explicitly on the REALITY
+      outbound (`crates/compat-config/src/render.rs`) — **correction,
+      not a fix**: sing-box's VLESS outbound already defaults this
+      field to `"xudp"` ("UDP packet encoding, xudp is used by default"
+      — sing-box's own docs), discovered only after an initial pass
+      mistakenly treated its absence as the likely cause of the
+      playback bug and shipped this exact change as if it were a fix.
+      It is kept because pinning a used default explicitly is
+      harmless/defensive, but it changes no runtime behavior, and the
+      hypothesis it was meant to address is weakened, not confirmed.
+      Separately documented (`docs/CLIENT_PROTOCOL_BEHAVIOR.md`): the
+      real Hiddify iOS onboarding URL is `?format=hiddify`, which is
+      byte-identical to `?format=uri` (plain share links) — this field
+      lives only in `?format=singbox`'s native JSON, so it may not even
+      reach a real Hiddify user who followed the documented setup flow.
+      Switching the documented onboarding URL to `?format=singbox` was
+      considered and rejected: `docs/ALMALINUX_DEPLOYMENT.md` already
+      documents, with reasoning, that Hiddify's bundled sing-box fork
+      can strict-unmarshal that format incorrectly and silently fail to
+      import (fetch succeeds, neither transport ever dials) — a worse
+      failure mode than the one this phase investigated.
+- [!] MTU/PMTU — re-evaluated, still deliberately not automated. No new
+      lever exists beyond what `docs/TELEGRAM_RESILIENCE_PLAN.md` §J
+      already covers; wiring `vpn-benchmark.sh`'s existing MTU/PMTU
+      probe into a routine/always-on check was considered and rejected
+      because that probe measures the VPS's OWN uplink to a fixed
+      target (documented in the script itself as NOT the same as a real
+      client's path MTU) — surfacing it as part of a "healthy" report
+      would manufacture exactly the false confidence this project
+      otherwise avoids.
+- [!] DNS handling — re-evaluated, still deliberately not touched.
+      Added a `dns` block to the generated config was considered and
+      rejected without new evidence that Hiddify's importer would even
+      honor one from a fetched subscription (untested, and the
+      project's own prior reasoning for omitting it still stands — see
+      `docs/CLIENT_PROTOCOL_BEHAVIOR.md`). Added the previously-missing
+      "DNS leak" and "Streaming (QUIC-heavy app)" columns to
+      `docs/DEVICE_ACCEPTANCE_TESTS.md` instead, since a real test has
+      still never been run and there was no column to record one.
+- [!] IPv6 handling — re-evaluated; `check_public_hostname_and_ipv6_policy`
+      (existing) already correctly distinguishes "no AAAA", "AAAA +
+      egress confirmed", "AAAA + egress broken", and "AAAA + egress
+      unknown" and only the broken case is fatal. No gap found worth
+      changing; client-side IPv6 leak behavior remains entirely
+      Hiddify's own, untestable from here.
+- [~] None of this phase's changes were exercised against a real
+      device, real Hiddify build, or a packet capture — see the
+      accompanying diagnosis's experiment plan for what a real device
+      test should check next. `cargo fmt --check`, `cargo clippy
+      --workspace --all-targets -- -D warnings`, and `cargo test
+      --workspace` all run clean (the same pre-existing, sandbox-only
+      `apps/admin` `cli` integration-test failures noted in Phase 15
+      reproduce identically without this phase's changes).

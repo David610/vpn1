@@ -44,6 +44,7 @@ Start here:
 - [`docs/DEVICE_ACCEPTANCE_TESTS.md`](docs/DEVICE_ACCEPTANCE_TESTS.md) — the real-device test matrix (all cells honestly "not yet tested" until someone runs it on a real VPS + device), including a Telegram-specific transport x function matrix
 - [`docs/TELEGRAM_RESILIENCE_PLAN.md`](docs/TELEGRAM_RESILIENCE_PLAN.md) — investigation and changes made to improve Telegram reliability under Russian censorship, and an honest statement of what remains unverified
 - [`docs/TELEGRAM_TROUBLESHOOTING.md`](docs/TELEGRAM_TROUBLESHOOTING.md) — the client-side troubleshooting procedure for a Telegram-specific connection problem
+- [`docs/YOUTUBE_STREAMING_DIAGNOSTIC_RUNBOOK.md`](docs/YOUTUBE_STREAMING_DIAGNOSTIC_RUNBOOK.md) — real-device test procedure for a YouTube-app-only video playback failure, ordered by diagnostic value
 
 ## Quickstart: native mode (local, loopback only)
 

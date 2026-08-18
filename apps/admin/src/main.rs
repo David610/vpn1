@@ -2809,6 +2809,22 @@ fn cmd_doctor(
         ProtocolCheckResult::NotRun
     };
 
+    // Independent Hysteria2/QUIC counterpart to the REALITY self-test
+    // above — see `check_l5_l6_hysteria2_protocol_selftest`'s doc
+    // comment for why it reports its own "L5-6-H2" line rather than
+    // folding into `protocol_result`/`ProtocolCheckResult`.
+    if protocol {
+        check_l5_l6_hysteria2_protocol_selftest(cfg, &mut failures, require_protocol);
+    } else {
+        report_check(
+            CheckStatus::Warn,
+            "L5-6-H2",
+            "Hysteria2 protocol handshake self-test not run (pass `--protocol` to actually dial \
+             this server's own Hysteria2 listener with a throwaway sing-box client) — passing \
+             every check above does NOT prove a real client can authenticate over Hysteria2",
+        );
+    }
+
     if telegram {
         print_telegram_diagnostics_summary(cfg, l1_l4_failures, protocol_result);
     }
@@ -4756,6 +4772,230 @@ fn run_reality_client_selftest(
         return Ok(RealitySelfTestOutcome::HandshakeRejected);
     }
     Ok(RealitySelfTestOutcome::Inconclusive)
+}
+
+/// Hysteria2 counterpart to `RealitySelfTestOutcome`. Deliberately
+/// coarser than REALITY's outcome: unlike REALITY (whose rejection
+/// message is a well-known, string-matched constant — see
+/// `reality_selftest_stderr_or_journal_indicates_rejection`), this
+/// project has not catalogued sing-box's exact client-side error text
+/// for a Hysteria2/QUIC authentication rejection, and guessing at an
+/// unverified string match would risk a false hard `FAIL` — worse than
+/// an honest "could not confirm." A failed dial is always
+/// `Inconclusive`, never a confident rejection verdict.
+enum Hysteria2SelfTestOutcome {
+    Pass,
+    Inconclusive,
+}
+
+/// Hysteria2 counterpart to `run_reality_client_selftest`: dials this
+/// server's OWN Hysteria2/QUIC listener on `127.0.0.1` with a throwaway
+/// `sing-box` client, using an active user's real password (and this
+/// deployment's real Salamander obfuscation password, if configured),
+/// and requires an actual HTTP success response back through the
+/// tunnel — a bound local SOCKS/mixed inbound alone is not evidence of
+/// authentication, same reasoning as the REALITY self-test.
+///
+/// Before this existed, `vpn doctor --protocol` verified ONLY REALITY's
+/// TCP/443 handshake; there was no live check of Hysteria2's UDP/QUIC
+/// path at all, so a Hysteria2-only regression (wrong password on disk,
+/// a listener that opens the port but doesn't actually complete QUIC
+/// handshakes, a sing-box UDP/QUIC defect) could pass every existing
+/// health check while being completely broken for a real client. That
+/// gap meant this project could never rule out "the Hysteria2 listener
+/// itself is broken" as a cause of a real-world playback failure —
+/// nothing here ever actually dialed it.
+///
+/// `tls.insecure: true` is deliberate and narrower than it looks: this
+/// dials `127.0.0.1` while asserting `server_name` = the deployment's
+/// real public hostname (mirroring the REALITY self-test's use of the
+/// decoy hostname over a loopback connection), so the presented
+/// certificate's CN/SAN can never line up with the address actually
+/// dialed regardless of whether the certificate itself is valid. This
+/// is NOT a certificate-validity check — that already exists separately
+/// (`health-check.sh`'s "Hysteria TLS cert not expired", and whatever a
+/// real client validates against the real public IP) — it exists purely
+/// to exercise the QUIC handshake, password authentication, and UDP
+/// relay path end to end.
+fn run_hysteria2_client_selftest(
+    cfg: &DeploymentConfig,
+    hysteria: &Hysteria2ServerParams,
+    test_user: &CompatUser,
+    hysteria_port: u16,
+) -> Result<Hysteria2SelfTestOutcome> {
+    let local_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .context("reserving a local port for the throwaway Hysteria2 client")?;
+        listener.local_addr()?.port()
+    };
+
+    let mut outbound = json!({
+        "type": "hysteria2",
+        "tag": "hysteria2-selftest",
+        "server": "127.0.0.1",
+        "server_port": hysteria_port,
+        "password": test_user.hysteria2_password.expose(),
+        "tls": {
+            "enabled": true,
+            "server_name": cfg.public_host,
+            "insecure": true,
+        }
+    });
+    if let Some(pw) = &hysteria.obfs_password {
+        outbound["obfs"] = json!({ "type": "salamander", "password": pw.expose() });
+    }
+
+    let client_config = json!({
+        "log": { "level": "error" },
+        "inbounds": [
+            { "type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": local_port }
+        ],
+        "outbounds": [ outbound, { "type": "direct", "tag": "direct" } ],
+        "route": { "final": "hysteria2-selftest" }
+    });
+
+    let tmp = tempfile::NamedTempFile::new()
+        .context("creating throwaway Hysteria2 client config file")?;
+    std::fs::write(tmp.path(), serde_json::to_vec_pretty(&client_config)?)
+        .context("writing throwaway Hysteria2 client config")?;
+
+    let child = std::process::Command::new(&cfg.singbox_binary)
+        .arg("run")
+        .arg("-c")
+        .arg(tmp.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("spawning throwaway sing-box Hysteria2 client")?;
+
+    // Same never-leave-an-orphan guarantee as the REALITY self-test.
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut guard = KillOnDrop(child);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut client_bound = true;
+    while !tcp_port_reachable(
+        "127.0.0.1",
+        local_port,
+        std::time::Duration::from_millis(100),
+    ) {
+        if std::time::Instant::now() >= deadline {
+            client_bound = false;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+
+    let relay_ok = client_bound
+        && socks5_http_get_succeeds(
+            local_port,
+            "127.0.0.1",
+            cfg.subscription.listen_port,
+            "/healthz",
+            std::time::Duration::from_secs(4),
+        );
+
+    let _ = guard.0.kill();
+    let _ = guard.0.wait();
+
+    if relay_ok {
+        Ok(Hysteria2SelfTestOutcome::Pass)
+    } else {
+        Ok(Hysteria2SelfTestOutcome::Inconclusive)
+    }
+}
+
+/// Hysteria2 counterpart to `check_l5_l6_protocol_selftest`. Deliberately
+/// separate from that function, from `ProtocolCheckResult`, and from the
+/// Telegram/client-acceptance summary functions that consume it — those
+/// are written specifically around REALITY's `Pass` /
+/// `HandshakeRejected` / `Inconclusive` three-way distinction (see
+/// `RealitySelfTestOutcome`'s doc comment), which this Hysteria2 check
+/// cannot make (see `Hysteria2SelfTestOutcome`'s doc comment). Reusing
+/// that type here would either force a fake `HandshakeRejected` verdict
+/// or silently redefine what "L5-6" means to those existing summaries.
+/// This reports its own "L5-6-H2" line instead, contributing to the
+/// same `failures` counter every other `doctor` check already uses.
+fn check_l5_l6_hysteria2_protocol_selftest(
+    cfg: &DeploymentConfig,
+    failures: &mut u32,
+    require_protocol: bool,
+) {
+    if !cfg.singbox_binary.exists() {
+        report_protocol_unavailable(
+            require_protocol,
+            failures,
+            format!(
+                "cannot self-test Hysteria2: sing-box binary not found at {:?}",
+                cfg.singbox_binary
+            ),
+        );
+        return;
+    }
+    let hysteria = load_hysteria_params(cfg);
+    let users = match store::load_users(&cfg.users_file()) {
+        Ok(users) => users,
+        Err(e) => {
+            report_protocol_unavailable(
+                require_protocol,
+                failures,
+                format!("cannot self-test Hysteria2: failed to load users: {e}"),
+            );
+            return;
+        }
+    };
+    let now = UnixSeconds::now().0 as i64;
+    let Some(test_user) = users.iter().find(|user| user.is_active(now)) else {
+        report_protocol_unavailable(
+            require_protocol,
+            failures,
+            "cannot self-test Hysteria2: there is no enabled, unexpired user",
+        );
+        return;
+    };
+    let port = cfg.hysteria2.listen_port;
+
+    match run_hysteria2_client_selftest(cfg, &hysteria, test_user, port) {
+        Ok(Hysteria2SelfTestOutcome::Pass) => {
+            report_check(
+                CheckStatus::Ok,
+                "L5-6-H2",
+                format!(
+                    "Hysteria2 protocol self-test: a throwaway sing-box client using an active \
+                     user's real password (and this deployment's obfuscation password, if \
+                     configured) completed a QUIC/UDP handshake through 127.0.0.1:{port} and \
+                     returned application bytes end-to-end"
+                ),
+            );
+        }
+        Ok(Hysteria2SelfTestOutcome::Inconclusive) => {
+            report_protocol_unavailable(
+                require_protocol,
+                failures,
+                "Hysteria2 protocol self-test INCONCLUSIVE: the throwaway client did not return \
+                 an HTTP success response through the live Hysteria2 listener. This can be a \
+                 password/obfuscation mismatch, a listener/UDP problem, or a transient failure \
+                 — inspect both sing-box processes' logs. Unlike the REALITY self-test, this \
+                 project has not catalogued a reliable client-side error string for a Hysteria2 \
+                 authentication rejection, so this can never report a definitive handshake-\
+                 rejected verdict, only OK, or WARN (FAIL under --require-protocol).",
+            );
+        }
+        Err(e) => {
+            report_protocol_unavailable(
+                require_protocol,
+                failures,
+                format!("cannot self-test Hysteria2: {e}"),
+            );
+        }
+    }
 }
 
 /// A definitive signal that the handshake does not work — our own throwaway
