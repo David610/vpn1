@@ -80,10 +80,20 @@ assumption.
 ## UDP / TCP behavior
 
 - **VLESS+REALITY**: runs over TCP/443 by design (the REALITY disguise
-  requires a real TCP TLS handshake with a decoy). sing-box's VLESS
-  implementation supports UDP relay multiplexed over that same TCP
-  connection (standard sing-box/VLESS behavior, not a vpn1-specific
-  configuration) — no separate UDP listener or config is added for it.
+  requires a real TCP TLS handshake with a decoy). Any UDP the client
+  sends (including a device's own QUIC/HTTP3 traffic to third-party
+  sites) is relayed multiplexed over that same TCP connection. The
+  generated outbound sets `"packet_encoding": "xudp"` (added
+  2026-08-18) specifically so that relay gets full-cone NAT and
+  per-destination session framing instead of sing-box's legacy
+  encoding-less UDP relay — without it, every UDP "flow" (a QUIC
+  connection included) is head-of-line-blocked behind ordinary TCP
+  loss/reordering on the REALITY connection, which disproportionately
+  hurts QUIC-heavy traffic (streaming video, calls) while leaving small
+  plain-HTTPS requests unaffected. See `crates/compat-config/src/
+  render.rs`'s `render_singbox_client_subscription_with_profile` for
+  the exact field and rationale, and `docs/PERFORMANCE_OPTIMIZATION_PLAN.md`
+  for why this was not previously set.
 - **Hysteria2**: UDP/443 end to end (QUIC-based) — this is the entire
   point of offering it as a secondary transport. **UDP/443 is
   meaningfully more likely to be blocked, throttled, or simply

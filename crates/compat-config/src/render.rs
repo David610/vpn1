@@ -202,6 +202,18 @@ pub fn render_singbox_client_subscription_with_profile(
                 "server_port": ep.port,
                 "uuid": user.vless_uuid,
                 "flow": "xtls-rprx-vision",
+                // Without this, sing-box's VLESS outbound relays UDP with
+                // no full-cone NAT support and no per-destination session
+                // multiplexing, forcing every "UDP" flow (QUIC included)
+                // through TCP-shaped semantics on top of the TCP/443
+                // REALITY connection. That head-of-line-blocks a whole
+                // QUIC flow behind ordinary TCP loss/reordering — fine for
+                // a handful of small requests, and exactly the failure
+                // shape reported for QUIC-heavy apps (sustained video
+                // playback) while plain HTTPS keeps working. "xudp" is
+                // sing-box/Xray's documented fix for VLESS+REALITY UDP
+                // relay (see sing-box's VLESS outbound docs).
+                "packet_encoding": "xudp",
                 "tls": {
                     "enabled": true,
                     "server_name": ep.server_name.clone().unwrap_or_else(|| ep.host.clone()),
@@ -484,6 +496,12 @@ mod tests {
         assert_eq!(reality["tls"]["utls"]["fingerprint"], "chrome");
         assert_eq!(reality["tls"]["reality"]["public_key"], "abc123");
         assert_eq!(reality["tls"]["reality"]["short_id"], "0a1b2c3d");
+        // xudp is the one deliberate exception to "minimal": without it,
+        // sing-box's VLESS outbound has no full-cone UDP relay, which
+        // head-of-line-blocks QUIC-heavy traffic (video, calls) behind
+        // REALITY's TCP/443 connection — see the comment at this field's
+        // call site in render_singbox_client_subscription_with_profile.
+        assert_eq!(reality["packet_encoding"], "xudp");
         let urltest = outbounds.iter().find(|o| o["type"] == "urltest").unwrap();
         assert_eq!(urltest["url"], "https://www.gstatic.com/generate_204");
 
@@ -493,7 +511,6 @@ mod tests {
             "mux",
             "fragment",
             "padding",
-            "packet_encoding",
             "tcp_fast_open",
             "tcp_keep_alive",
             "auto_route",
